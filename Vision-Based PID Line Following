@@ -1,0 +1,209 @@
+from picamera2 import Picamera2
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+
+# ================= GPIO SETUP =================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Motor A (Right)
+ENA = 18; IN1 = 23; IN2 = 24
+# Motor B (Left)
+ENB = 13; IN3 = 5; IN4 = 6
+
+GPIO.setup([ENA, IN1, IN2, ENB, IN3, IN4], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA, 100); pwmA.start(0)
+pwmB = GPIO.PWM(ENB, 100); pwmB.start(0)
+
+# ================= CONTROL PARAMETERS =================
+INVERT_STEERING = False 
+
+# --- Motor Balance Offsets ---
+LEFT_MOTOR_OFFSET = 1.0   # Keep at 1.0 (normal power)
+RIGHT_MOTOR_OFFSET = 1.20 # Boost right motor by 20% to fix drifting
+
+# Color Detection (HSV range for a BLACK line)
+LOWER_COLOR = np.array([0, 0, 0])
+UPPER_COLOR = np.array([180, 255, 60])
+
+# --- UPDATED: Smoother PID Parameters to prevent oversteering ---
+Kp = 0.10  # Lowered so it reacts less aggressively
+Ki = 0.01  
+Kd = 0.50  # Raised to dampen the steering and stop early turning (0.85)
+last_error = 0
+integral = 0 
+
+# Speed Controls 
+BASE_SPEED = 40 
+MIN_SPEED = 25
+MAX_SPEED = 90
+
+# ================= HELPER FUNCTIONS =================
+def set_motor_speed(speed_left, speed_right):
+    """ Allows forward and reverse control for spinning on sharp corners """
+    
+    # --- Apply the balance offsets here ---
+    speed_left = speed_left * LEFT_MOTOR_OFFSET
+    speed_right = speed_right * RIGHT_MOTOR_OFFSET
+
+    # Clamp the speeds so they don't exceed hardware limits
+    speed_left = max(min(speed_left, 100), -100)
+    speed_right = max(min(speed_right, 100), -100)
+
+    # Right Motor (A)
+    if speed_right >= 0:
+        GPIO.output(IN1, 0); GPIO.output(IN2, 1)
+    else:
+        GPIO.output(IN1, 1); GPIO.output(IN2, 0)
+    # FORCE IT TO BE A WHOLE NUMBER TO PREVENT CRASHES
+    pwmA.ChangeDutyCycle(int(abs(speed_right)))
+
+    # Left Motor (B)
+    if speed_left >= 0:
+        GPIO.output(IN3, 1); GPIO.output(IN4, 0)
+    else:
+        GPIO.output(IN3, 0); GPIO.output(IN4, 1)
+    # FORCE IT TO BE A WHOLE NUMBER TO PREVENT CRASHES
+    pwmB.ChangeDutyCycle(int(abs(speed_left)))
+
+def stop_motors():
+    pwmA.ChangeDutyCycle(0)
+    pwmB.ChangeDutyCycle(0)
+
+# ================= DIAGNOSTIC TEST =================
+print("--- PRE-FLIGHT MOTOR TEST ---")
+print("Testing Left Motor...")
+set_motor_speed(50, 0)  
+time.sleep(1)
+stop_motors()
+
+print("Testing Right Motor...")
+set_motor_speed(0, 50)  
+time.sleep(1)
+stop_motors()
+print("Test Complete. Warming up camera...")
+
+# ================= CAMERA SETUP =================
+picam2 = Picamera2()
+config = picam2.create_preview_configuration(
+    main={"format": 'XRGB8888', "size": (320, 240)}
+)
+picam2.configure(config)
+picam2.start()
+time.sleep(2) 
+
+# ================= MAIN LOOP =================
+try:
+    print("Starting Line Follower...")
+    while True:
+        frame = picam2.capture_array()
+        
+        # ROTATE IMAGE 180 DEGREES
+        #frame = cv2.flip(frame, -1) 
+        
+        # 1. IMAGE PROCESSING 
+        h, w, _ = frame.shape
+        # --- UPDATED: Lowered ROI so the robot looks closer to its wheels ---
+        roi = frame[int(h*0.60):int(h*1.00), 0:w] 
+        
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, LOWER_COLOR, UPPER_COLOR)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        cv2.line(roi, (int(w/2), 0), (int(w/2), roi.shape[0]), (0, 0, 255), 1)
+
+        # 2. POSITION TRACKING & PID
+        if len(contours) > 0:
+            c = max(contours, key=cv2.contourArea)
+            
+            if cv2.contourArea(c) > 300:
+                M = cv2.moments(c)
+
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+
+                    cv2.circle(roi, (cx, cy), 5, (0, 255, 0), -1)
+
+                    # A. CALCULATE ERROR 
+                    error = (w / 2) - cx
+
+                    if abs(error) < 5: # Narrowed deadband to react sooner
+                        error = 0
+
+                    # B. FULL PID CONTROL FOR STEERING
+                    
+                    # 1. Proportional: Current error
+                    
+                    # 2. Integral: Accumulated error
+                    integral += error
+                    
+                    # Anti-Windup: Cap the integral so it doesn't build up to infinity
+                    integral = max(min(integral, 1500), -1500)
+                    
+                    # S-Curve Fix: Reset integral when crossing the center line
+                    if (error > 0 and last_error < 0) or (error < 0 and last_error > 0):
+                        integral = 0
+
+                    # 3. Derivative: Rate of change of error
+                    derivative = error - last_error
+                    
+                    # Calculate final turn value
+                    turn = (Kp * error) + (Ki * integral) + (Kd * derivative)
+                    
+                    if INVERT_STEERING:
+                        turn = -turn
+
+                    last_error = error
+
+                    # C. ADAPTIVE SPEED - UPDATED
+                    turn_abs = abs(turn)
+                    # Increased slightly from 0.15 to brake a tiny bit on corners without stalling
+                    speed_reduce = turn_abs * 0.25 
+                    base_dynamic = BASE_SPEED - speed_reduce
+                    base_dynamic = max(MIN_SPEED, min(MAX_SPEED, base_dynamic))
+
+                    left_speed = base_dynamic - turn
+                    right_speed = base_dynamic + turn
+
+                    set_motor_speed(left_speed, right_speed)
+            
+            else:
+                # 3. LINE LOST RECOVERY (Small Contours)
+                if last_error > 20:
+                    set_motor_speed(-35, 35) if not INVERT_STEERING else set_motor_speed(35, -35)
+                elif last_error < -20:
+                    set_motor_speed(35, -35) if not INVERT_STEERING else set_motor_speed(-35, 35)
+                else:
+                    set_motor_speed(20, 20)
+
+        else:
+            # 3. LINE LOST RECOVERY (No Contours)
+            if last_error > 20:
+                set_motor_speed(-35, 35) if not INVERT_STEERING else set_motor_speed(35, -35)
+            elif last_error < -20:
+                set_motor_speed(35, -35) if not INVERT_STEERING else set_motor_speed(-35, 35)
+            else:
+                set_motor_speed(20, 20)
+
+        # 4. DEBUG WINDOWS 
+        cv2.imshow("Color View", roi) 
+        cv2.imshow("HSV Mask", mask)  
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    pass
+
+finally:
+    stop_motors()
+    GPIO.cleanup()
+    picam2.close()
+    cv2.destroyAllWindows()
+    print("Program Ended Safely.")
+
+
