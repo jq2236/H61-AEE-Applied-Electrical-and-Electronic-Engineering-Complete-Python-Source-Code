@@ -1,0 +1,386 @@
+import sys
+import types
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import time
+import threading
+
+# ================= 1. BYPASS PYTHON 3.13 BUG =================
+dummy_imp = types.ModuleType('imp')
+dummy_imp.find_module = lambda *args, **kwargs: None
+sys.modules['imp'] = dummy_imp
+
+import tensorflow as tf
+from picamera2 import Picamera2
+
+# ================= 2. GLOBAL SETTINGS & VARIABLES =================
+SHOW_VIDEO = True 
+
+current_label = "Scanning..."
+current_confidence = 0.0
+frame_for_ai = None
+ai_is_running = True
+
+# ================= 3. THE BACKGROUND AI THREAD =================
+def ai_worker_thread():
+    global current_label, current_confidence, frame_for_ai, ai_is_running
+    
+    print("[AI Thread] Loading TFLite Model...")
+    try:
+        interpreter = tf.lite.Interpreter(model_path="/home/pi/Week3 line/model_unquant.tflite", num_threads=4)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        with open('/home/pi/Week3 line/labels.txt', 'r') as f:
+            labels = [line.strip().split(' ', 1)[1] if ' ' in line else line.strip() for line in f.readlines()]
+            
+        print("[AI Thread] Online and actively scanning!")
+    except Exception as e:
+        print(f"[AI Thread FATAL ERROR]: {e}")
+        return
+
+    while ai_is_running:
+        if frame_for_ai is not None:
+            try:
+                img_to_process = frame_for_ai.copy()
+                frame_for_ai = None 
+                
+                input_data = np.expand_dims(img_to_process, axis=0)
+                normalized_image_array = (np.float32(input_data) / 127.5) - 1.0
+                
+                interpreter.set_tensor(input_details[0]['index'], normalized_image_array)
+                interpreter.invoke()
+                
+                results = np.squeeze(interpreter.get_tensor(output_details[0]['index']))
+                top_index = np.argmax(results)
+                
+                current_confidence = float(results[top_index])
+                current_label = str(labels[top_index])
+                
+            except Exception as e:
+                print(f"[AI Thread Error]: {e}")
+        else:
+            time.sleep(0.005)
+
+# ================= 4. GPIO SETUP =================
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+ENA = 18; IN1 = 23; IN2 = 24 
+ENB = 13; IN3 = 5; IN4 = 6   
+
+GPIO.setup([ENA, IN1, IN2, ENB, IN3, IN4], GPIO.OUT)
+pwmA = GPIO.PWM(ENA, 100); pwmA.start(0)
+pwmB = GPIO.PWM(ENB, 100); pwmB.start(0)
+
+def set_motor_speed(speed_left, speed_right):
+    speed_left = max(min(speed_left, 100), -100)
+    speed_right = max(min(speed_right, 100), -100)
+
+    if speed_right >= 0:
+        GPIO.output(IN1, 0); GPIO.output(IN2, 1)
+    else:
+        GPIO.output(IN1, 1); GPIO.output(IN2, 0)
+    pwmA.ChangeDutyCycle(abs(speed_right))
+
+    if speed_left >= 0:
+        GPIO.output(IN3, 1); GPIO.output(IN4, 0)
+    else:
+        GPIO.output(IN3, 0); GPIO.output(IN4, 1)
+    pwmB.ChangeDutyCycle(abs(speed_left))
+
+def stop_motors():
+    pwmA.ChangeDutyCycle(0)
+    pwmB.ChangeDutyCycle(0)
+
+# ================= 5. LINE FOLLOWER & AI PARAMETERS =================
+# ADDED: "QR code" and "Fingerprint" to the target symbols
+TARGET_SYMBOLS = ["Left", "Right", "Forward", "Caution", "Button", "Recycle", "QR code", "Fingerprint"] 
+AI_CONFIDENCE_THRESHOLD = 0.70
+
+INVERT_STEERING = False 
+
+# --- HSV COLOR RANGES FOR LINES ---
+LOWER_BLACK = np.array([0, 0, 0])
+UPPER_BLACK = np.array([180, 255, 60])
+
+LOWER_CYAN = np.array([70, 80, 80]) 
+UPPER_CYAN = np.array([110, 255, 255])
+
+LOWER_BLUE = np.array([90, 80, 80])  
+UPPER_BLUE = np.array([140, 255, 255])
+
+# --- CONTROLLED CURVE PID ---
+Kp = 0.1 
+Ki = 0.01  
+Kd = 0.3  
+
+last_error = 0; integral = 0
+
+# --- SPEEDS ---
+BASE_SPEED = 35 
+MIN_SPEED = 35  
+MAX_SPEED = 100 
+
+# ================= 6. START MAIN EXECUTION =================
+if __name__ == '__main__':
+    ai_thread = threading.Thread(target=ai_worker_thread)
+    ai_thread.daemon = True
+    ai_thread.start()
+
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2) 
+
+    is_on_line = False 
+    
+    # --- ROLLING BUFFER FOR VOTING ---
+    prediction_history = []
+
+    try:
+        print("[Main Loop] Starting Autonomous Mode. Press 'Ctrl+C' to quit.")
+        while True:
+            frame_rgb = picam2.capture_array()
+            
+            if SHOW_VIDEO:
+                frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            else:
+                frame_bgr = frame_rgb 
+                
+            h, w, _ = frame_rgb.shape
+            
+            # --- AI DATA PREP (80% ROI) ---
+            ai_bottom = int(h * 0.80)
+            cropped_frame = frame_rgb[0:ai_bottom, 0:w]
+            frame_for_ai = cv2.resize(cropped_frame, (224, 224)) 
+            
+            if SHOW_VIDEO:
+                cv2.rectangle(frame_bgr, (0, 0), (w, ai_bottom), (255, 0, 0), 2)
+                display_hist = [lbl[:1] for lbl in prediction_history if lbl in ["Left", "Right", "Forward"]]
+                cv2.putText(frame_bgr, f"AI: {current_label} ({current_confidence:.1%}) Vote: {display_hist}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+            is_anticipating_symbol = False
+
+            # --- THE IDENTIFY & BYPASS LOGIC ---
+            if current_label in TARGET_SYMBOLS:
+                required_confidence = 0.85 if current_label in ["Left", "Right", "Forward"] else AI_CONFIDENCE_THRESHOLD
+                
+                if current_confidence >= required_confidence:
+                    prediction_history.append(current_label)
+                else:
+                    prediction_history.append("Low_Confidence")
+            else:
+                prediction_history.append("Unknown")
+                
+            if len(prediction_history) > 5:
+                prediction_history.pop(0)
+
+            if any(lbl in TARGET_SYMBOLS for lbl in prediction_history):
+                is_anticipating_symbol = True
+
+            confirmed_label = None
+            
+            # 1. Check blocking action symbols
+            if prediction_history.count("Recycle") >= 2:
+                confirmed_label = "Recycle"
+            elif prediction_history.count("Left") >= 3: 
+                confirmed_label = "Left"
+            elif prediction_history.count("Right") >= 2:
+                confirmed_label = "Right"
+            elif prediction_history.count("Forward") >= 2:
+                confirmed_label = "Forward"
+            else:
+                for symbol in ["Caution", "Button"]:
+                    if prediction_history.count(symbol) >= 2:
+                        confirmed_label = symbol
+                        break
+
+            # 2. ADDED: Non-blocking UI update for Biometrics
+            # Since we do not set 'confirmed_label', the robot continues straight to the PID line follower logic.
+            if prediction_history.count("QR code") >= 1 or prediction_history.count("Fingerprint") >= 1:
+                if SHOW_VIDEO:
+                    cv2.putText(frame_bgr, "biometric", (10, 130), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 0, 255), 3)
+
+            # 3. Action Sequence Execution
+            if confirmed_label in ["Left", "Right", "Forward"]:
+                arrows_present = sum([1 for arrow in ["Left", "Right", "Forward"] if arrow in prediction_history])
+                if arrows_present > 1:
+                    confirmed_label = None
+                    if SHOW_VIDEO:
+                        cv2.putText(frame_bgr, "AI CONFUSED: Arrow Conflict", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            if confirmed_label:
+                print(f"SYMBOL DETECTED CONFIRMED: {confirmed_label}!")
+                
+                if confirmed_label != "Forward":
+                    stop_motors()
+                    
+                if SHOW_VIDEO:
+                    cv2.putText(frame_bgr, f"IDENTIFIED: {confirmed_label}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                    cv2.imshow("Robot Vision", frame_bgr)
+                    cv2.waitKey(1)
+                
+                if confirmed_label in ["Caution", "Button"]:
+                    time.sleep(1.0) 
+                    set_motor_speed(40, 40)
+                    time.sleep(0.5)         
+                    
+                elif confirmed_label == "Forward":
+                    set_motor_speed(40, 40) 
+                    time.sleep(0.8) 
+                    
+                elif confirmed_label == "Left":
+                    set_motor_speed(40, 40)
+                    time.sleep(0.2) 
+                    
+                    set_motor_speed(0, 60) 
+                    time.sleep(0.8) 
+                    
+                elif confirmed_label == "Right":
+                    set_motor_speed(40, 40)
+                    time.sleep(0.2) 
+                    
+                    set_motor_speed(60, 0) 
+                    time.sleep(0.8) 
+                    
+                elif confirmed_label == "Recycle":
+                    set_motor_speed(-80, 80) if not INVERT_STEERING else set_motor_speed(80, -80) 
+                    time.sleep(1.5) 
+                
+                current_confidence = 0.0
+                current_label = "Scanning..."
+                frame_for_ai = None 
+                prediction_history.clear() 
+                
+                continue 
+
+            # --- PID LINE FOLLOWING (20% ROI) ---
+            roi_top = int(h * 0.80) 
+            roi_bottom = int(h * 1.0) 
+            roi = frame_bgr[roi_top:roi_bottom, 0:w] 
+            
+            if SHOW_VIDEO:
+                cv2.rectangle(frame_bgr, (0, roi_top), (w, roi_bottom), (0, 255, 0), 2)
+            
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV) if SHOW_VIDEO else cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+            
+            # --- COLOR MASKING FOR ALL 3 LINES ---
+            mask_cyan = cv2.inRange(hsv, LOWER_CYAN, UPPER_CYAN)
+            
+            mask_red_upper = cv2.inRange(hsv, np.array([150, 80, 80]), np.array([180, 255, 255]))
+            mask_red_lower = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([15, 255, 255]))
+            mask_true_blue = cv2.inRange(hsv, LOWER_BLUE, UPPER_BLUE)
+            mask_blue = mask_red_upper | mask_red_lower | mask_true_blue
+
+            mask_black = cv2.inRange(hsv, LOWER_BLACK, UPPER_BLACK)
+
+            contours_cyan, _ = cv2.findContours(mask_cyan, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_blue, _ = cv2.findContours(mask_blue, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours_black, _ = cv2.findContours(mask_black, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if SHOW_VIDEO:
+                cv2.line(roi, (int(w/2), 0), (int(w/2), roi.shape[0]), (0, 0, 255), 1)
+
+            valid_cyan = [c for c in contours_cyan if cv2.contourArea(c) > 100]
+            valid_blue = [c for c in contours_blue if cv2.contourArea(c) > 100]
+            valid_black = [c for c in contours_black if cv2.contourArea(c) > 300] 
+
+            valid_line_detected = False
+            track_color = (0, 255, 0)
+
+            if len(valid_cyan) > 0:
+                c = max(valid_cyan, key=cv2.contourArea)
+                valid_line_detected = True
+                track_color = (255, 255, 0)
+            elif len(valid_blue) > 0:
+                c = max(valid_blue, key=cv2.contourArea)
+                valid_line_detected = True
+                track_color = (255, 0, 0) 
+            elif len(valid_black) > 0:
+                c = max(valid_black, key=cv2.contourArea)
+                valid_line_detected = True
+                track_color = (0, 255, 0)
+
+            if valid_line_detected:
+                is_on_line = True 
+                
+                M = cv2.moments(c)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+
+                    if SHOW_VIDEO:
+                        cv2.circle(roi, (cx, cy), 5, track_color, -1)
+
+                    error = (w / 2) - cx
+                    if abs(error) < 25: 
+                        error = 0
+
+                    integral += error
+                    integral = max(min(integral, 1500), -1500)
+                    if (error > 0 and last_error < 0) or (error < 0 and last_error > 0): integral = 0
+
+                    derivative = error - last_error
+                    turn = (Kp * error) + (Ki * integral) + (Kd * derivative)
+                    turn = max(min(turn, 30), -30) 
+                    if INVERT_STEERING: turn = -turn
+                    last_error = error
+
+                    turn_abs = abs(turn)
+                    speed_reduce = turn_abs * 0.85 
+                    
+                    active_base_speed = 35 if is_anticipating_symbol else BASE_SPEED
+                    active_min_speed = 35 if is_anticipating_symbol else MIN_SPEED
+                    
+                    base_dynamic = max(active_min_speed, min(MAX_SPEED, active_base_speed - speed_reduce))
+
+                    left_speed = max(0, base_dynamic - turn)
+                    right_speed = max(0, base_dynamic + turn)
+
+                    set_motor_speed(left_speed, right_speed)
+                    
+                    if SHOW_VIDEO:
+                        text = "STATUS: FOLLOWING (ANTICIPATING SYMBOL)" if is_anticipating_symbol else "STATUS: FOLLOWING LINE"
+                        cv2.putText(frame_bgr, text, (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, track_color, 2)
+            else:
+                if SHOW_VIDEO:
+                    cv2.putText(frame_bgr, "STATUS: SEARCHING", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+                
+                if is_on_line and abs(last_error) > 70:
+                    print("Sharp 90-Degree Corner Detected! Forcing hard turn...")
+                    if last_error > 0: 
+                        set_motor_speed(-70, 70) if not INVERT_STEERING else set_motor_speed(70, -70)
+                    else:              
+                        set_motor_speed(70, -70) if not INVERT_STEERING else set_motor_speed(-70, 70)
+                    time.sleep(0.2) 
+                
+                is_on_line = False 
+                
+                if last_error > 20: 
+                    set_motor_speed(0, 60) if not INVERT_STEERING else set_motor_speed(60, 0)
+                elif last_error < -20: 
+                    set_motor_speed(60, 0) if not INVERT_STEERING else set_motor_speed(0, 60)
+                else: 
+                    set_motor_speed(45, 45) 
+
+            if SHOW_VIDEO:
+                cv2.imshow("Robot Vision", frame_bgr) 
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        print("Shutting down safely...")
+        ai_is_running = False 
+        stop_motors()
+        GPIO.cleanup()
+        picam2.stop()
+        cv2.destroyAllWindows()
+        print("Program Ended Safely.")
+
