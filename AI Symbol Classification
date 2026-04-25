@@ -1,0 +1,145 @@
+import sys
+import types
+import cv2
+import numpy as np
+import time
+import threading
+
+# ================= 1. BYPASS PYTHON 3.13 BUG =================
+dummy_imp = types.ModuleType('imp')
+dummy_imp.find_module = lambda *args, **kwargs: None
+sys.modules['imp'] = dummy_imp
+
+import tensorflow as tf
+from picamera2 import Picamera2
+
+# ================= 2. GLOBAL THREADING VARIABLES =================
+current_label = "Scanning..."
+current_confidence = 0.0
+frame_for_ai = None
+ai_is_running = True
+
+# ================= 3. THE BACKGROUND AI THREAD =================
+def ai_worker_thread():
+    global current_label, current_confidence, frame_for_ai, ai_is_running
+    
+    print("[AI Thread] Loading TFLite Model...")
+    try:
+        interpreter = tf.lite.Interpreter(model_path="/home/pi/line_and_symbol/model_unquant.tflite")
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        
+        with open('/home/pi/line_and_symbol/labels.txt', 'r') as f:
+            labels = [line.strip().split(' ', 1)[1] if ' ' in line else line.strip() for line in f.readlines()]
+            
+        print("[AI Thread] Online and actively scanning!")
+    except Exception as e:
+        print(f"[AI Thread FATAL ERROR]: {e}")
+        return
+
+    while ai_is_running:
+        if frame_for_ai is not None:
+            try:
+                img_to_process = frame_for_ai.copy()
+                frame_for_ai = None 
+                
+                input_data = np.expand_dims(img_to_process, axis=0)
+                normalized_image_array = (np.float32(input_data) / 127.5) - 1.0
+                
+                interpreter.set_tensor(input_details[0]['index'], normalized_image_array)
+                interpreter.invoke()
+                
+                results = np.squeeze(interpreter.get_tensor(output_details[0]['index']))
+                top_index = np.argmax(results)
+                
+                current_confidence = float(results[top_index])
+                current_label = str(labels[top_index])
+                
+            except Exception as e:
+                print(f"[AI Thread Error]: {e}")
+        else:
+            time.sleep(0.01)
+
+# ================= 4. AI PARAMETERS =================
+TARGET_SYMBOLS = ["Forward", "Backward", "Right", "Left", "Not so Half Circle", 
+                  "Octagon", "QR Code", "Plus", "Trapezium", "Star", "Diamond", 
+                  "Caution", "Button", "3 Quarter Circle", "Fingerprint"] 
+
+AI_CONFIDENCE_THRESHOLD = 0.80
+
+# ================= 5. START MAIN EXECUTION =================
+if __name__ == '__main__':
+    ai_thread = threading.Thread(target=ai_worker_thread)
+    ai_thread.daemon = True
+    ai_thread.start()
+
+    picam2 = Picamera2()
+    config = picam2.create_video_configuration(main={"size": (640, 480), "format": "RGB888"})
+    picam2.configure(config)
+    picam2.start()
+    time.sleep(2) 
+
+    ai_cooldown_until = 0
+
+    try:
+        print("[Main Loop] Starting Vision Mode. Press 'q' to quit.")
+        while True:
+            frame_rgb = picam2.capture_array()
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+            h, w, _ = frame_rgb.shape
+            
+            # --- AI DATA PREP ---
+            # Analyzes the top 50% of the screen
+            ai_bottom = int(h * 0.50)
+            
+            cropped_frame = frame_rgb[0:ai_bottom, 0:w]
+            frame_for_ai = cv2.resize(cropped_frame, (224, 224)) 
+
+            # Draw a box showing the AI's "field of view"
+            cv2.rectangle(frame_bgr, (0, 0), (w, ai_bottom), (255, 0, 0), 2)
+            
+            if time.time() < ai_cooldown_until:
+                cv2.putText(frame_bgr, "AI: COOLDOWN ACTIVE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            else:
+                cv2.putText(frame_bgr, f"AI: {current_label} ({current_confidence:.1%})", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+            # --- THE IDENTIFY LOGIC ---
+            if time.time() > ai_cooldown_until and current_confidence >= AI_CONFIDENCE_THRESHOLD and current_label in TARGET_SYMBOLS:
+                print(f"SYMBOL DETECTED: {current_label}! Pausing detection for 3 seconds.")
+                
+                # Display the detection prominently on the screen
+                cv2.putText(frame_bgr, f"IDENTIFIED: {current_label}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+                cv2.imshow("Robot Vision", frame_bgr)
+                cv2.waitKey(1)
+                
+                # Pause the loop to show the identified text
+                time.sleep(3.0) 
+                
+                # Reset variables and trigger a brief cooldown before scanning again
+                ai_cooldown_until = time.time() + 2.5
+                current_confidence = 0.0
+                current_label = "Scanning..."
+                frame_for_ai = None 
+                
+                continue 
+
+            else:
+                cv2.putText(frame_bgr, "STATUS: SCANNING", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+
+            # Show the live feed
+            cv2.imshow("Robot Vision", frame_bgr) 
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        print("Shutting down safely...")
+        ai_is_running = False 
+        picam2.stop()
+        cv2.destroyAllWindows()
+        print("Program Ended Safely.")
+
+
