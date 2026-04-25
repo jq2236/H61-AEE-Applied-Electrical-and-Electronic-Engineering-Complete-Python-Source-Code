@@ -1,0 +1,83 @@
+import RPi.GPIO as GPIO
+import time
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Motor pins (BCM)
+ENA = 18
+IN1 = 23
+IN2 = 24
+
+ENB = 13
+IN3 = 5
+IN4 = 6
+
+GPIO.setup([ENA, IN1, IN2, ENB, IN3, IN4], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA, 100)
+pwmB = GPIO.PWM(ENB, 100)
+
+pwmA.start(100)
+pwmB.start(100)
+
+# ðŸ”¹ Calibrated value (adjust if needed)
+TIME_PER_DEGREE = 0.193/45   # seconds per degree
+
+def stop():
+    GPIO.output([IN1, IN2, IN3, IN4], GPIO.LOW)
+
+def turn_left(angle):
+    turn_time = angle * TIME_PER_DEGREE
+
+    # Left turn: right wheels move, left wheels stop
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.HIGH)
+
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+
+    time.sleep(turn_time)
+    stop()
+
+def turn_right(angle):
+    turn_time = angle * TIME_PER_DEGREE
+
+    # Right turn: left wheels move, right wheels stop
+    GPIO.output(IN1, GPIO.HIGH)
+    GPIO.output(IN2, GPIO.LOW)
+
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
+
+    time.sleep(turn_time)
+    stop()
+
+print("Robot Angle Control")
+print("Commands:")
+print("L45, L60, L90  â†’ Left turn")
+print("R45, R60, R90  â†’ Right turn")
+print("Q â†’ Quit")
+
+try:
+    while True:
+        cmd = input("Command: ").upper()
+
+        if cmd == 'Q':
+            break
+
+        elif cmd.startswith('L'):
+            angle = int(cmd[1:])
+            turn_left(angle)
+
+        elif cmd.startswith('R'):
+            angle = int(cmd[1:])
+            turn_right(angle)
+
+finally:
+    stop()
+    pwmA.stop()
+    pwmB.stop()
+    GPIO.cleanup()
+
+
