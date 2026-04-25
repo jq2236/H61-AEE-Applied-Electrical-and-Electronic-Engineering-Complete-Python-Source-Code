@@ -1,0 +1,203 @@
+import RPi.GPIO as GPIO
+import time
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setwarnings(False)
+
+# Motor pins (BCM)
+ENA = 18
+IN1 = 23
+IN2 = 24
+
+ENB = 13
+IN3 = 5
+IN4 = 6
+
+GPIO.setup([ENA, IN1, IN2, ENB, IN3, IN4], GPIO.OUT)
+
+pwmA = GPIO.PWM(ENA, 100)
+pwmB = GPIO.PWM(ENB, 100)
+
+pwmA.start(0)
+pwmB.start(0)
+
+# ðŸ”¹ CALIBRATION VALUE (CRITICAL FOR ACCURACY)
+MAX_SPEED_MPS = 0.77   # meters per second at 100% PWM
+
+# ðŸ”¹ STATE TRACKING VARIABLES
+total_distance = 0.0
+current_velocity = 0.0  # Signed: Positive = Forward, Negative = Backward
+last_time = time.time()
+
+def speed_to_pwm(speed_mps):
+    if speed_mps <= 0:
+        return 0
+    duty = (speed_mps / MAX_SPEED_MPS) * 100
+    return min(100, max(0, duty))
+
+def update_distance():
+    global total_distance, last_time
+    now = time.time()
+    elapsed_time = now - last_time
+    distance_segment = abs(current_velocity) * elapsed_time
+    total_distance += distance_segment
+    last_time = now
+    return distance_segment
+
+def stop():
+    global current_velocity
+    update_distance()
+    GPIO.output([IN1, IN2, IN3, IN4], GPIO.LOW)
+    pwmA.ChangeDutyCycle(0)
+    pwmB.ChangeDutyCycle(0)
+    current_velocity = 0.0
+    print("Stopped.")
+
+def move_forward(speed_mps):
+    global current_velocity
+    update_distance()
+    duty = speed_to_pwm(speed_mps)
+    
+    GPIO.output(IN1, GPIO.LOW)
+    GPIO.output(IN2, GPIO.HIGH)
+    GPIO.output(IN3, GPIO.HIGH)
+    GPIO.output(IN4, GPIO.LOW)
+    
+    pwmA.ChangeDutyCycle(duty)
+    pwmB.ChangeDutyCycle(duty)
+    current_velocity = speed_mps
+    # print moved to main loop to avoid spamming during auto-drive
+
+def move_backward(speed_mps):
+    global current_velocity
+    update_distance()
+    duty = speed_to_pwm(speed_mps)
+    
+    GPIO.output(IN1, GPIO.HIGH)
+    GPIO.output(IN2, GPIO.LOW)
+    GPIO.output(IN3, GPIO.LOW)
+    GPIO.output(IN4, GPIO.HIGH)
+    
+    pwmA.ChangeDutyCycle(duty)
+    pwmB.ChangeDutyCycle(duty)
+    current_velocity = -speed_mps
+
+# ---------------------------------------------------------
+# ðŸ”¹ NEW FUNCTION: AUTO DRIVE DISTANCE
+# ---------------------------------------------------------
+def drive_specific_distance(target_distance, speed):
+    """
+    Moves the robot a specific distance at a specific speed.
+    """
+    global total_distance
+    
+    # Validation
+    if speed <= 0 or speed > MAX_SPEED_MPS:
+        print(f"Error: Speed must be between 0 and {MAX_SPEED_MPS}")
+        return
+
+    # 1. Calculate how long we need to drive
+    # Time = Distance / Speed
+    duration = abs(target_distance) / speed
+    
+    print(f"--- AUTO DRIVE STARTED ---")
+    print(f"Target: {target_distance}m @ {speed}m/s")
+    print(f"Est. Duration: {duration:.2f} seconds")
+
+    # 2. Start Moving
+    if target_distance > 0:
+        move_forward(speed)
+    else:
+        move_backward(speed)
+
+    # 3. Wait Loop (updates distance while waiting)
+    start_time = time.time()
+    while (time.time() - start_time) < duration:
+        update_distance() # Keep the odometer running
+        time.sleep(0.1)   # Check every 100ms
+        
+        # Optional: Print progress
+        elapsed = time.time() - start_time
+        remaining = duration - elapsed
+        print(f"\rDriving... {remaining:.1f}s left | Total Dist: {total_distance:.2f}m", end="")
+
+    # 4. Stop when time is up
+    print("\n--- TARGET REACHED ---")
+    stop()
+
+# ---------------------------------------------------------
+# MAIN LOOP
+# ---------------------------------------------------------
+print("Robot Motion Control")
+print(f"Calibration: 100% PWM = {MAX_SPEED_MPS} m/s")
+print("\nCommands:")
+print("F0.2       â†’ Forward at 0.2 m/s (Continuous)")
+print("B0.1       â†’ Backward at 0.1 m/s (Continuous)")
+print("D 1.0 0.2  â†’ Drive 1.0 meter at 0.2 m/s (Auto-Stop)")
+print("S          â†’ Stop")
+print("Q          â†’ Quit")
+
+last_time = time.time()
+
+try:
+    while True:
+        # Input splits by space for the D command
+        user_input = input(f"\n[Total Dist: {total_distance:.2f}m] Command: ").upper().strip()
+        parts = user_input.split()
+
+        if not parts:
+            continue
+            
+        cmd = parts[0]
+
+        if cmd == 'Q':
+            break
+
+        elif cmd == 'S':
+            stop()
+
+        # ðŸ”¹ NEW COMMAND PROCESSING FOR 'D'
+        elif cmd == 'D':
+            try:
+                # Expecting: D <distance> <speed>
+                if len(parts) < 3:
+                    print("Usage: D [distance_meters] [speed_mps]")
+                    continue
+                
+                dist_req = float(parts[1])
+                speed_req = float(parts[2])
+                
+                drive_specific_distance(dist_req, speed_req)
+                
+            except ValueError:
+                print("Invalid numbers. Example: D 1.0 0.5")
+
+        # Existing Forward Logic
+        elif cmd.startswith('F'):
+            try:
+                speed = float(cmd[1:])
+                move_forward(speed)
+                print(f"Moving Forward: {speed} m/s")
+            except ValueError:
+                print("Invalid format.")
+
+        # Existing Backward Logic
+        elif cmd.startswith('B'):
+            try:
+                speed = float(cmd[1:])
+                move_backward(speed)
+                print(f"Moving Backward: {speed} m/s")
+            except ValueError:
+                print("Invalid format.")
+        
+        # Update distance one last time before waiting for next input
+        update_distance()
+
+finally:
+    stop()
+    pwmA.stop()
+    pwmB.stop()
+    GPIO.cleanup()
+    print(f"\nFinal Distance Traveled: {total_distance:.4f} meters")
+
+
